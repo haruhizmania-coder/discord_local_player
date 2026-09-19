@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# 音源ファイルはリポジトリに含めない(フォルダだけ残す)
+sounds/*
+!sounds/.gitkeep
