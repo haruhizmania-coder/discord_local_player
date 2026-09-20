@@ -1,7 +1,10 @@
+import asyncio
 import logging
 import os
+import random
 import shutil
 import sys
+from collections import deque
 from pathlib import Path
 
 import discord
@@ -18,10 +21,40 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 SOUNDS_DIR = Path(os.getenv("SOUNDS_DIR", "sounds")).resolve()
 EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
 DEFAULT_VOLUME = 0.5
+MAX_QUEUE = 100
+LOOP_LABELS = {"off": "オフ", "track": "1曲リピート", "queue": "キュー全体リピート"}
 
 volumes: dict[int, float] = {}
-# 再生ごとに発行するトークン。/stop や別の曲の再生で古いループを止めるために使う
-playbacks: dict[int, object] = {}
+
+
+class GuildState:
+    """サーバーごとの再生状態。キューには sounds/ からの相対パスを積む。"""
+
+    def __init__(self) -> None:
+        self.queue: deque[str] = deque()
+        self.current: str | None = None
+        self.loop = "off"
+        self.skipping = False
+        # 再生ごとに発行する目印。/stop や切断で無効化し、古い after コールバックを無視する
+        self.token: object | None = None
+
+    def clear(self) -> None:
+        self.queue.clear()
+        self.current = None
+        self.token = None
+
+
+states: dict[int, GuildState] = {}
+
+
+def get_state(guild_id: int) -> GuildState:
+    return states.setdefault(guild_id, GuildState())
+
+
+def drop_state(guild_id: int) -> None:
+    state = states.pop(guild_id, None)
+    if state:
+        state.clear()
 
 
 def list_sounds() -> list[str]:
@@ -53,6 +86,11 @@ class LocalPlayer(discord.Client):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (sounds: %s)", self.user, SOUNDS_DIR)
 
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+        # Bot が切断された(キックなど)ときはキューを破棄する
+        if self.user and member.id == self.user.id and after.channel is None:
+            drop_state(member.guild.id)
+
 
 client = LocalPlayer()
 tree = client.tree
@@ -71,25 +109,57 @@ async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient 
     return vc
 
 
-def start_playback(vc: discord.VoiceClient, path: Path, loop: bool) -> None:
-    guild_id = vc.guild.id
+def begin(vc: discord.VoiceClient, state: GuildState, name: str, path: Path) -> None:
     token = object()
-    playbacks[guild_id] = token
+    state.token = token
+    state.current = name
+    loop = asyncio.get_running_loop()
 
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(str(path), executable=FFMPEG_PATH),
-        volume=volumes.get(guild_id, DEFAULT_VOLUME),
+        volume=volumes.get(vc.guild.id, DEFAULT_VOLUME),
     )
 
     def after(error: Exception | None) -> None:
         if error:
             log.error("Playback error: %s", error)
-        if loop and playbacks.get(guild_id) is token and vc.is_connected():
-            client.loop.call_soon_threadsafe(start_playback, vc, path, loop)
+        # after は再生スレッドから呼ばれるので、状態の更新はイベントループ側で行う
+        loop.call_soon_threadsafe(on_track_end, vc, state, token, name)
 
-    if vc.is_playing() or vc.is_paused():
-        vc.stop()
-    vc.play(source, after=after)
+    try:
+        vc.play(source, after=after)
+    except Exception:
+        state.current = None
+        state.token = None
+        raise
+
+
+def start_next(vc: discord.VoiceClient, state: GuildState) -> None:
+    """キューの先頭から、再生できる音源を探して再生する。なければ待機状態にする。"""
+    while state.queue:
+        name = state.queue.popleft()
+        path = resolve_sound(name)
+        if path is None:
+            log.warning("Skipping missing file: %s", name)
+            continue
+        begin(vc, state, name, path)
+        return
+    state.current = None
+    state.token = None
+
+
+def on_track_end(vc: discord.VoiceClient, state: GuildState, token: object, name: str) -> None:
+    if state.token is not token:
+        return  # /stop や切断で無効化済み
+    skipping, state.skipping = state.skipping, False
+    if not vc.is_connected():
+        drop_state(vc.guild.id)
+        return
+    if state.loop == "track" and not skipping:
+        state.queue.appendleft(name)
+    elif state.loop == "queue":
+        state.queue.append(name)
+    start_next(vc, state)
 
 
 async def sound_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -107,23 +177,23 @@ async def join(interaction: discord.Interaction) -> None:
         await interaction.followup.send(f"{vc.channel.name} に参加しました。", ephemeral=True)
 
 
-@tree.command(name="leave", description="ボイスチャンネルから退出します")
+@tree.command(name="leave", description="ボイスチャンネルから退出します(キューも破棄されます)")
 @app_commands.guild_only()
 async def leave(interaction: discord.Interaction) -> None:
     vc = interaction.guild.voice_client
     if vc is None:
         await interaction.response.send_message("ボイスチャンネルに参加していません。", ephemeral=True)
         return
-    playbacks.pop(interaction.guild.id, None)
+    drop_state(interaction.guild.id)
     await vc.disconnect()
     await interaction.response.send_message("退出しました。")
 
 
-@tree.command(name="play", description="sounds フォルダの音源を再生します")
-@app_commands.describe(name="音源ファイル名", loop="繰り返し再生する")
+@tree.command(name="play", description="sounds フォルダの音源を再生します(再生中ならキューに追加)")
+@app_commands.describe(name="音源ファイル名")
 @app_commands.autocomplete(name=sound_autocomplete)
 @app_commands.guild_only()
-async def play(interaction: discord.Interaction, name: str, loop: bool = False) -> None:
+async def play(interaction: discord.Interaction, name: str) -> None:
     await interaction.response.defer()
     path = resolve_sound(name)
     if path is None:
@@ -132,18 +202,42 @@ async def play(interaction: discord.Interaction, name: str, loop: bool = False) 
     vc = await ensure_voice(interaction)
     if vc is None:
         return
-    start_playback(vc, path, loop)
-    await interaction.followup.send(f"再生中: `{name}`" + (" (ループ)" if loop else ""))
+    state = get_state(interaction.guild.id)
+    if len(state.queue) >= MAX_QUEUE:
+        await interaction.followup.send(f"キューがいっぱいです (最大 {MAX_QUEUE} 件)。", ephemeral=True)
+        return
+    canonical = path.relative_to(SOUNDS_DIR).as_posix()
+    state.queue.append(canonical)
+    if state.current is None:
+        start_next(vc, state)
+        await interaction.followup.send(f"再生中: `{canonical}`")
+    else:
+        await interaction.followup.send(f"キューに追加しました (#{len(state.queue)}): `{canonical}`")
 
 
-@tree.command(name="stop", description="再生を停止します")
+@tree.command(name="skip", description="再生中の音源をスキップして次へ進みます")
+@app_commands.guild_only()
+async def skip(interaction: discord.Interaction) -> None:
+    vc = interaction.guild.voice_client
+    state = states.get(interaction.guild.id)
+    if vc is None or state is None or state.current is None:
+        await interaction.response.send_message("再生中の音源はありません。", ephemeral=True)
+        return
+    skipped = state.current
+    state.skipping = True
+    vc.stop()  # after コールバック経由で次の曲へ進む
+    await interaction.response.send_message(f"スキップしました: `{skipped}`")
+
+
+@tree.command(name="stop", description="再生を停止し、キューを空にします")
 @app_commands.guild_only()
 async def stop(interaction: discord.Interaction) -> None:
     vc = interaction.guild.voice_client
-    if vc is None or not (vc.is_playing() or vc.is_paused()):
+    state = states.get(interaction.guild.id)
+    if vc is None or state is None or state.current is None:
         await interaction.response.send_message("再生中の音源はありません。", ephemeral=True)
         return
-    playbacks.pop(interaction.guild.id, None)
+    state.clear()
     vc.stop()
     await interaction.response.send_message("停止しました。")
 
@@ -168,6 +262,73 @@ async def resume(interaction: discord.Interaction) -> None:
         return
     vc.resume()
     await interaction.response.send_message("再開しました。")
+
+
+@tree.command(name="queue", description="再生中の音源とキューを表示します")
+@app_commands.guild_only()
+async def queue_command(interaction: discord.Interaction) -> None:
+    state = states.get(interaction.guild.id)
+    if state is None or (state.current is None and not state.queue):
+        await interaction.response.send_message("キューは空です。", ephemeral=True)
+        return
+    lines = [f"再生中: `{state.current}`" if state.current else "再生中: なし"]
+    if state.loop != "off":
+        lines.append(f"リピート: {LOOP_LABELS[state.loop]}")
+    length = sum(len(line) for line in lines)
+    for i, name in enumerate(state.queue, 1):
+        if length + len(name) + 8 > 1800:
+            lines.append(f"…ほか {len(state.queue) - i + 1} 件")
+            break
+        lines.append(f"{i}. {name}")
+        length += len(name) + 8
+    await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="remove", description="キューから指定した番号の音源を削除します")
+@app_commands.describe(index="/queue に表示される番号")
+@app_commands.guild_only()
+async def remove(interaction: discord.Interaction, index: app_commands.Range[int, 1, MAX_QUEUE]) -> None:
+    state = states.get(interaction.guild.id)
+    if state is None or index > len(state.queue):
+        await interaction.response.send_message("その番号の音源はキューにありません。", ephemeral=True)
+        return
+    removed = state.queue[index - 1]
+    del state.queue[index - 1]
+    await interaction.response.send_message(f"キューから削除しました: `{removed}`")
+
+
+@tree.command(name="clear", description="キューを空にします(再生中の音源はそのまま)")
+@app_commands.guild_only()
+async def clear(interaction: discord.Interaction) -> None:
+    state = states.get(interaction.guild.id)
+    if state is None or not state.queue:
+        await interaction.response.send_message("キューは空です。", ephemeral=True)
+        return
+    count = len(state.queue)
+    state.queue.clear()
+    await interaction.response.send_message(f"キューを空にしました ({count} 件)。")
+
+
+@tree.command(name="shuffle", description="キューの順番をシャッフルします")
+@app_commands.guild_only()
+async def shuffle(interaction: discord.Interaction) -> None:
+    state = states.get(interaction.guild.id)
+    if state is None or len(state.queue) < 2:
+        await interaction.response.send_message("シャッフルできる音源がキューにありません。", ephemeral=True)
+        return
+    items = list(state.queue)
+    random.shuffle(items)
+    state.queue = deque(items)
+    await interaction.response.send_message("キューをシャッフルしました。")
+
+
+@tree.command(name="loop", description="リピート再生の設定を切り替えます")
+@app_commands.describe(mode="リピートの種類")
+@app_commands.choices(mode=[app_commands.Choice(name=label, value=key) for key, label in LOOP_LABELS.items()])
+@app_commands.guild_only()
+async def loop_command(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
+    get_state(interaction.guild.id).loop = mode.value
+    await interaction.response.send_message(f"リピートを「{mode.name}」にしました。")
 
 
 @tree.command(name="volume", description="音量を変更します (0-100)")
